@@ -1028,3 +1028,17 @@ function json(data, status = 200) {
     }
   );
               }
+// ============================================================
+// CLEAN GENERATED EMAIL TEXT
+// ============================================================
+
+function cleanText(value) {
+  if (typeof value !== "string") {
+    return "";
+  }
+
+  return value
+    .replace(/\r\n/g, "\n")
+    .replace(/\u0000/g, "")
+    .trim();
+      }
