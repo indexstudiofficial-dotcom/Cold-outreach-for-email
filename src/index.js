@@ -1,23 +1,25 @@
 // ============================================================
 // OUTREACH EMAIL WORKER
 //
-// Flow:
+// WORKFLOW:
 // 1. Supabase Cron sends POST.
-// 2. Find oldest lead where message IS NULL.
-// 3. Load the application and product information.
-// 4. Find the matching connected Gmail account.
+// 2. Find oldest leads row where message IS NULL.
+// 3. Get the matching application.
+// 4. Find the application's connected Gmail integration.
 // 5. Generate a personalized email using Sarvam AI.
 // 6. Send using Composio GMAIL_SEND_EMAIL.
-// 7. Save the email body in leads.message.
+// 7. Save the email body to leads.message.
 //
-// Required Cloudflare secrets:
+// REQUIRED CLOUDFLARE SECRETS:
 // SUPABASE_URL
 // SUPABASE_SERVICE_ROLE_KEY
 // SARVAM_API_KEY
 // COMPOSIO_API_KEY
 //
-// Optional Cloudflare variable:
-// COMPOSIO_GMAIL_VERSION = latest
+// EXISTING DATABASE TABLES:
+// leads
+// applications
+// user_integrations
 //
 // No database columns are added.
 // planner_status is never accessed.
@@ -28,91 +30,72 @@
 // CONFIGURATION
 // ============================================================
 
-const COMPOSIO_BASE_URL =
-  "https://backend.composio.dev/api/v3.1";
-
 const SARVAM_URL =
   "https://api.sarvam.ai/v1/chat/completions";
 
-const GMAIL_TOOL = "GMAIL_SEND_EMAIL";
+const COMPOSIO_BASE_URL =
+  "https://backend.composio.dev/api/v3.1";
+
+const COMPOSIO_GMAIL_TOOL =
+  "GMAIL_SEND_EMAIL";
 
 
 // ============================================================
-// MAIN REQUEST HANDLER
+// MAIN HANDLER
 // ============================================================
 
 export default {
   async fetch(request, env) {
-    // --------------------------------------------------------
-    // Only accept POST requests from the Cron workflow.
-    // --------------------------------------------------------
-
     if (request.method !== "POST") {
-      return jsonResponse(
-        {
-          ok: false,
-          error: "POST requests only"
-        },
-        405
-      );
+      return json({
+        ok: false,
+        error: "POST requests only"
+      }, 405);
     }
 
     try {
       validateEnvironment(env);
 
       // ------------------------------------------------------
-      // Step 1: Find the oldest unprocessed lead.
+      // STEP 1: FIND OLDEST LEAD WITH NULL MESSAGE
       // ------------------------------------------------------
 
-      const lead = await findOldestPendingLead(env);
+      const lead = await getOldestPendingLead(env);
 
       if (!lead) {
-        return jsonResponse({
+        return json({
           ok: true,
           processed: false,
-          reason: "No leads with a NULL message were found"
+          reason: "No leads with NULL message"
         });
       }
 
+      console.log("Processing lead:", lead.id);
+
       // ------------------------------------------------------
-      // Step 2: Validate required lead information.
+      // STEP 2: VALIDATE LEAD
       // ------------------------------------------------------
 
-      if (!lead.application_id) {
-        return jsonResponse({
-          ok: false,
-          processed: false,
-          lead_id: lead.id,
-          error: "Lead has no application_id"
-        }, 400);
+      if (!lead.application_id || !lead.user_id) {
+        throw new Error(
+          "Lead is missing application_id or user_id"
+        );
       }
 
-      if (!lead.user_id) {
-        return jsonResponse({
-          ok: false,
-          processed: false,
-          lead_id: lead.id,
-          error: "Lead has no user_id"
-        }, 400);
-      }
-
-      if (!lead.email || !isValidEmail(lead.email)) {
-        return jsonResponse({
-          ok: false,
-          processed: false,
-          lead_id: lead.id,
-          error: "Lead has no usable email address"
-        }, 400);
+      if (!isValidEmail(lead.email)) {
+        throw new Error(
+          `Lead ${lead.id} has no valid recipient email`
+        );
       }
 
       // ------------------------------------------------------
-      // Step 3: Load the application.
+      // STEP 3: GET APPLICATION
       //
-      // applications.name    = sender company name
+      // applications.name = company name
       // applications.company = company/product description
-      // applications.domain  = sender company domain
+      // applications.domain = company domain
       //
-      // planner_status is not accessed.
+      // planner_status is NOT used.
       // ------------------------------------------------------
 
       const application = await getApplication(
@@ -122,32 +105,19 @@ export default {
       );
 
       if (!application) {
-        return jsonResponse({
-          ok: false,
-          processed: false,
-          lead_id: lead.id,
-          error: "Matching application was not found"
-        }, 404);
+        throw new Error(
+          "Application not found for this lead"
+        );
       }
 
-      if (!application.name || !application.company) {
-        return jsonResponse({
-          ok: false,
-          processed: false,
-          lead_id: lead.id,
-          error:
-            "Application is missing its company name or company description"
-        }, 400);
-      }
-
-      if (!application.domain) {
-        return jsonResponse({
-          ok: false,
-          processed: false,
-          lead_id: lead.id,
-          error:
-            "Application domain is missing; cannot create the required signature"
-        }, 400);
+      if (
+        !application.name ||
+        !application.company ||
+        !application.domain
+      ) {
+        throw new Error(
+          "Application must contain name, company description, and domain"
+        );
       }
 
       const senderDomain = normalizeDomain(
@@ -155,23 +125,19 @@ export default {
       );
 
       if (!senderDomain) {
-        return jsonResponse({
-          ok: false,
-          processed: false,
-          lead_id: lead.id,
-          error: "Application domain is invalid"
-        }, 400);
+        throw new Error(
+          "Invalid sender domain in applications.domain"
+        );
       }
 
       // ------------------------------------------------------
-      // Step 4: Find this user's Gmail connection.
+      // STEP 4: FIND CONNECTED GMAIL ACCOUNT
       //
-      // Match all three:
-      // - application_id
-      // - user_id
-      // - integration_id = gmail
-      //
-      // Never use another application's connection.
+      // Must match:
+      // application_id
+      // user_id
+      // integration_id = gmail
+      // status = connected
       // ------------------------------------------------------
 
       const gmail = await getGmailIntegration(
@@ -181,25 +147,17 @@ export default {
       );
 
       if (!gmail) {
-        return jsonResponse({
-          ok: false,
-          processed: false,
-          lead_id: lead.id,
-          error:
-            "No connected Gmail integration exists for this user and application"
-        }, 409);
+        throw new Error(
+          "No connected Gmail integration found for this application and user"
+        );
       }
 
       // ------------------------------------------------------
-      // Step 5: Generate the sender name.
+      // STEP 5: GET CONSISTENT SENDER NAME
       //
-      // A deterministic selection ensures the same application
-      // keeps the same sender name without adding a database
-      // column.
-      //
-      // IMPORTANT:
-      // Use a fictional sender name only if it is an authorized
-      // identity for the account. Do not impersonate a real person.
+      // These are fictional example names.
+      // Use a name the account owner is authorized to send as.
+      // No additional database column is required.
       // ------------------------------------------------------
 
       const senderName = chooseSenderName(
@@ -207,10 +165,10 @@ export default {
       );
 
       // ------------------------------------------------------
-      // Step 6: Generate the personalized email using Sarvam.
+      // STEP 6: GENERATE EMAIL USING SARVAM AI
       // ------------------------------------------------------
 
-      const generatedEmail = await generateOutreachEmail(
+      const generated = await generateEmail(
         env,
         lead,
         application,
@@ -218,133 +176,70 @@ export default {
         senderDomain
       );
 
-      // ------------------------------------------------------
-      // Step 7: Check the AI result.
-      // ------------------------------------------------------
-
-      if (generatedEmail.fit_status === "not_a_fit") {
-        // Do not send an irrelevant email.
-        //
-        // Because no new database columns are allowed and
-        // message must remain NULL for unprocessed leads,
-        // we return the reason without changing the lead.
-        //
-        // This means Cron may encounter this lead again.
-        // See the limitation explained below.
-        return jsonResponse({
-          ok: true,
-          processed: false,
-          lead_id: lead.id,
-          reason: "Lead is not a suitable prospect",
-          fit_reason: generatedEmail.fit_reason
-        });
-      }
-
-      if (
-        generatedEmail.fit_status !== "qualified" &&
-        generatedEmail.fit_status !== "needs_review"
-      ) {
-        throw new Error(
-          "Sarvam returned an invalid fit_status"
-        );
-      }
-
-      // Do not automatically send leads whose suitability
-      // cannot be established.
-      if (generatedEmail.fit_status === "needs_review") {
-        return jsonResponse({
-          ok: true,
-          processed: false,
-          lead_id: lead.id,
-          reason: "Lead requires review before sending",
-          fit_reason: generatedEmail.fit_reason
-        });
-      }
-
       const subject = cleanText(
-        generatedEmail.subject
+        generated.subject
       );
 
-      const body = cleanEmailBody(
-        generatedEmail.message
+      const message = cleanText(
+        generated.message
       );
 
-      if (!subject || !body) {
+      if (!subject || !message) {
         throw new Error(
           "Sarvam returned an empty subject or email body"
         );
       }
 
-      // ------------------------------------------------------
-      // Step 8: Check for unresolved placeholders.
-      // ------------------------------------------------------
-
-      if (containsUnresolvedPlaceholders(subject + "\n" + body)) {
+      if (containsPlaceholders(subject + "\n" + message)) {
         throw new Error(
           "Generated email contains unresolved placeholders"
         );
       }
 
-      // ------------------------------------------------------
-      // Step 9: Verify the required signature.
-      //
-      // Expected:
-      //
-      // Best,
-      // Alex Morgan
-      // example.com
-      //
-      // Company name must not appear as part of the signature.
-      // ------------------------------------------------------
-
       verifySignature(
-        body,
+        message,
         senderName,
         senderDomain
       );
 
       // ------------------------------------------------------
-      // Step 10: Send email through Composio.
-      //
-      // Uses the connection_id from user_integrations.
+      // STEP 7: SEND EMAIL THROUGH COMPOSIO
       // ------------------------------------------------------
 
-      const sendResult = await sendGmailEmail(
+      const sendResult = await sendEmailWithComposio(
         env,
         gmail.connection_id,
+        lead.user_id,
         lead.email,
         subject,
-        body
+        message
       );
 
-      // ------------------------------------------------------
-      // Step 11: Confirm successful execution.
-      // ------------------------------------------------------
-
+      // Do not save the message if execution failed.
       if (!sendResult.success) {
         throw new Error(
-          "Composio did not confirm successful email delivery: " +
-          safeErrorText(sendResult.data)
+          "Composio email execution failed: " +
+          safeError(sendResult.response)
         );
       }
 
       // ------------------------------------------------------
-      // Step 12: Save the email body.
+      // STEP 8: SAVE MESSAGE AFTER SUCCESSFUL SEND
       //
-      // Save only after Composio reports success.
+      // Only update if message is still NULL.
       // ------------------------------------------------------
 
-      await saveLeadMessage(
+      await saveMessage(
         env,
         lead.id,
-        body
+        message
       );
 
       // ------------------------------------------------------
-      // Step 13: Return success.
+      // STEP 9: RETURN SUCCESS
       // ------------------------------------------------------
 
-      return jsonResponse({
+      return json({
         ok: true,
         processed: true,
         lead_id: lead.id,
@@ -352,20 +247,18 @@ export default {
         subject: subject,
         sender_name: senderName,
         sender_domain: senderDomain,
-        fit_status: generatedEmail.fit_status,
-        message_saved: true,
-        gmail_connection_id: gmail.connection_id
+        message_saved: true
       });
 
     } catch (error) {
       console.error(
-        "Outreach worker error:",
+        "Outreach Worker error:",
         error.message
       );
 
-      return jsonResponse({
+      return json({
         ok: false,
-        error: error.message || "Unexpected worker error"
+        error: error.message || "Unknown error"
       }, 500);
     }
   }
@@ -395,7 +288,7 @@ function validateEnvironment(env) {
 
 
 // ============================================================
-// SUPABASE REST HELPER
+// SUPABASE REST REQUEST
 // ============================================================
 
 async function supabaseRequest(
@@ -422,7 +315,7 @@ async function supabaseRequest(
 
   const text = await response.text();
 
-  let data = null;
+  let data;
 
   try {
     data = text ? JSON.parse(text) : null;
@@ -432,8 +325,8 @@ async function supabaseRequest(
 
   if (!response.ok) {
     throw new Error(
-      `Supabase error (${response.status}): ` +
-      safeErrorText(data)
+      `Supabase HTTP ${response.status}: ` +
+      safeError(data)
     );
   }
 
@@ -442,14 +335,10 @@ async function supabaseRequest(
 
 
 // ============================================================
-// FIND OLDEST PENDING LEAD
-//
-// No new columns are required.
-//
-// message IS NULL means the email body has not been saved.
+// FIND OLDEST LEAD WITH NULL MESSAGE
 // ============================================================
 
-async function findOldestPendingLead(env) {
+async function getOldestPendingLead(env) {
   const query =
     "leads" +
     "?select=id,application_id,user_id,first_name,last_name," +
@@ -464,25 +353,19 @@ async function findOldestPendingLead(env) {
   const rows = await supabaseRequest(
     env,
     query,
-    {
-      method: "GET"
-    }
+    { method: "GET" }
   );
 
-  return Array.isArray(rows) && rows.length > 0
-    ? rows[0]
-    : null;
+  if (!Array.isArray(rows) || rows.length === 0) {
+    return null;
+  }
+
+  return rows[0];
 }
 
 
 // ============================================================
-// GET MATCHING APPLICATION
-//
-// applications.name    = sender company name
-// applications.company = product/company description
-// applications.domain  = sender company domain
-//
-// planner_status is not selected or modified.
+// GET APPLICATION
 // ============================================================
 
 async function getApplication(
@@ -500,9 +383,7 @@ async function getApplication(
   const rows = await supabaseRequest(
     env,
     query,
-    {
-      method: "GET"
-    }
+    { method: "GET" }
   );
 
   return Array.isArray(rows) && rows.length > 0
@@ -512,9 +393,7 @@ async function getApplication(
 
 
 // ============================================================
-// GET CONNECTED GMAIL INTEGRATION
-//
-// Exact application + user + Gmail match.
+// GET USER'S CONNECTED GMAIL INTEGRATION
 // ============================================================
 
 async function getGmailIntegration(
@@ -537,9 +416,7 @@ async function getGmailIntegration(
   const rows = await supabaseRequest(
     env,
     query,
-    {
-      method: "GET"
-    }
+    { method: "GET" }
   );
 
   if (!Array.isArray(rows) || rows.length === 0) {
@@ -557,10 +434,18 @@ async function getGmailIntegration(
 
 
 // ============================================================
-// GENERATE PERSONALIZED EMAIL WITH SARVAM AI
+// SARVAM AI: GENERATE EMAIL
+//
+// IMPORTANT FIXES:
+// - reasoning_effort: null prevents reasoning from consuming
+//   the entire visible-output token budget.
+// - max_tokens: 2048 gives the email sufficient output space.
+// - response_format: json_object requests valid JSON.
+// - Better diagnostics report the actual API response if
+//   the content is missing.
 // ============================================================
 
-async function generateOutreachEmail(
+async function generateEmail(
   env,
   lead,
   application,
@@ -570,55 +455,44 @@ async function generateOutreachEmail(
   const systemPrompt = `
 You are a professional B2B outreach email writer.
 
-Generate a concise, genuinely personalized email based on
-the lead and sender company data.
+Generate one personalized outreach email using the data provided.
 
-SENDER DATA:
-- Company name: ${application.name}
-- Company description/product: ${application.company}
-- Company domain: ${senderDomain}
-- Sender name: ${senderName}
+SENDER:
+Company name: ${application.name}
+Product description: ${application.company}
+Domain: ${senderDomain}
+Sender name: ${senderName}
 
-LEAD DATA:
-- First name: ${lead.first_name || ""}
-- Last name: ${lead.last_name || ""}
-- Full name: ${lead.full_name || ""}
-- Job title: ${lead.job_title || ""}
-- Company name: ${lead.company_name || ""}
-- Company domain: ${lead.company_domain || ""}
-- Company website: ${lead.company_website || ""}
-- Industry: ${lead.company_industry || ""}
-- Company size: ${lead.company_size || ""}
-- Country: ${lead.company_country || ""}
-- City: ${lead.company_city || ""}
-- LinkedIn: ${lead.linkedin_url || ""}
+LEAD:
+First name: ${lead.first_name || ""}
+Last name: ${lead.last_name || ""}
+Full name: ${lead.full_name || ""}
+Job title: ${lead.job_title || ""}
+Company: ${lead.company_name || ""}
+Company domain: ${lead.company_domain || ""}
+Website: ${lead.company_website || ""}
+Industry: ${lead.company_industry || ""}
+Company size: ${lead.company_size || ""}
+Country: ${lead.company_country || ""}
+City: ${lead.company_city || ""}
 
-RULES:
+EMAIL RULES:
 
-1. Understand the sender's product and target customers.
-2. Consider the lead's job title and company information.
-3. Personalize the opening when supported by the available facts.
-4. Do not claim that you browsed a website unless you actually did.
-5. Do not invent company facts, relationships, business problems,
-   product capabilities, results, or personal details.
-6. Do not assume the lead's company uses Shopify unless verified.
-7. If the company is not a plausible customer, use "not_a_fit".
-8. If suitability is uncertain, use "needs_review".
-9. Use "qualified" only when the available evidence supports a
-   plausible fit.
-10. If qualified, write a natural email of about 60-120 words.
-11. Avoid generic phrases such as "I came across your company
-    while researching" unless the context justifies them.
-12. Mention the sender company name in the email body only when
-    it sounds natural and relevant.
-13. Use one clear, low-pressure call to action.
-14. Never leave placeholders.
-15. Do not include the sender company name in the signature.
-16. Do not include a fake personal achievement or imply an
-    existing relationship.
-17. Generate a draft for sending only if fit_status is "qualified".
-18. Never output Markdown code fences.
-19. Return valid JSON only.
+1. Use the lead's real first name in the greeting when available.
+2. Personalize using the person's job title and company information.
+3. Explain the sender's actual product and relevant benefits.
+4. Do not invent facts, relationships, research, or business problems.
+5. Do not assume the lead's company uses Shopify without evidence.
+6. If company fit is uncertain, write a cautious, relevant introduction.
+7. Write approximately 60-120 words.
+8. Use a natural, professional tone.
+9. Include one simple, low-pressure question.
+10. The sender company name may appear in the body naturally.
+11. Do not include the sender company name in the signature.
+12. Never use unresolved placeholders.
+13. Do not claim guaranteed results.
+14. Generate a draft; the worker will send it.
+15. Return a JSON object only.
 
 SIGNATURE:
 
@@ -626,42 +500,64 @@ Best,
 ${senderName}
 ${senderDomain}
 
-The email body must end with exactly this signature.
+The signature must match this format exactly.
+Do not add anything after the domain.
 
-Return this JSON structure:
+OUTPUT JSON:
 
 {
-  "fit_status": "qualified",
-  "fit_reason": "Short explanation",
   "subject": "Email subject",
-  "message": "Complete email body, including signature",
-  "personalization_reason": "Facts used to personalize the email"
+  "message": "Complete email body including greeting and signature"
 }
 `;
 
-  const userData = {
-    lead: {
-      first_name: lead.first_name,
-      last_name: lead.last_name,
-      full_name: lead.full_name,
-      job_title: lead.job_title,
-      email: lead.email,
-      company_name: lead.company_name,
-      company_domain: lead.company_domain,
-      company_website: lead.company_website,
-      company_industry: lead.company_industry,
-      company_size: lead.company_size,
-      company_country: lead.company_country,
-      company_city: lead.company_city,
-      linkedin_url: lead.linkedin_url
+  const leadData = {
+    first_name: lead.first_name,
+    last_name: lead.last_name,
+    full_name: lead.full_name,
+    job_title: lead.job_title,
+    email: lead.email,
+    company_name: lead.company_name,
+    company_domain: lead.company_domain,
+    company_website: lead.company_website,
+    company_industry: lead.company_industry,
+    company_size: lead.company_size,
+    company_country: lead.company_country,
+    company_city: lead.company_city
+  };
+
+  const requestBody = {
+    model: "sarvam-105b",
+
+    messages: [
+      {
+        role: "system",
+        content: systemPrompt
+      },
+      {
+        role: "user",
+        content:
+          "Generate the outreach email from this lead data:\n" +
+          JSON.stringify(leadData)
+      }
+    ],
+
+    temperature: 0.3,
+
+    // CRITICAL FIX:
+    // Disable reasoning so short email generation has
+    // enough tokens for the actual visible response.
+    reasoning_effort: null,
+
+    // Give the generated JSON sufficient output space.
+    max_tokens: 2048,
+
+    // Ask Sarvam to return valid JSON.
+    response_format: {
+      type: "json_object"
     },
 
-    sender: {
-      company_name: application.name,
-      company_description: application.company,
-      domain: senderDomain,
-      sender_name: senderName
-    }
+    stream: false
   };
 
   const response = await fetchWithTimeout(
@@ -672,25 +568,9 @@ Return this JSON structure:
         "api-subscription-key": env.SARVAM_API_KEY,
         "Content-Type": "application/json"
       },
-      body: JSON.stringify({
-        model: "sarvam-105b",
-        temperature: 0.3,
-        max_tokens: 1200,
-        messages: [
-          {
-            role: "system",
-            content: systemPrompt
-          },
-          {
-            role: "user",
-            content:
-              "Generate an outreach email using this data:\n" +
-              JSON.stringify(userData)
-          }
-        ]
-      })
+      body: JSON.stringify(requestBody)
     },
-    45000
+    60000
   );
 
   const responseText = await response.text();
@@ -701,54 +581,105 @@ Return this JSON structure:
     result = JSON.parse(responseText);
   } catch {
     throw new Error(
-      `Sarvam returned non-JSON HTTP response: ${response.status}`
+      `Sarvam returned non-JSON HTTP response ` +
+      `${response.status}: ${responseText.slice(0, 1000)}`
     );
   }
 
   if (!response.ok) {
     throw new Error(
-      `Sarvam API error (${response.status}): ` +
-      safeErrorText(result)
+      `Sarvam API HTTP ${response.status}: ` +
+      safeError(result)
     );
   }
 
-  const content =
-    result?.choices?.[0]?.message?.content;
+  // --------------------------------------------------------
+  // EXTRACT THE VISIBLE MODEL RESPONSE
+  // --------------------------------------------------------
 
-  if (!content || typeof content !== "string") {
+  const choice = result?.choices?.[0];
+
+  let content =
+    choice?.message?.content ??
+    choice?.delta?.content ??
+    choice?.text ??
+    result?.output_text ??
+    result?.content ??
+    null;
+
+  // Support APIs that return text blocks as an array.
+  if (Array.isArray(content)) {
+    content = content
+      .map(item => {
+        if (typeof item === "string") {
+          return item;
+        }
+
+        return item?.text || "";
+      })
+      .join("\n");
+  }
+
+  if (typeof content !== "string" || !content.trim()) {
+    // Return diagnostic information without exposing API keys.
+    const finishReason =
+      choice?.finish_reason || "unknown";
+
+    const usage = result?.usage || null;
+
+    const reasoningPresent = Boolean(
+      choice?.message?.reasoning_content
+    );
+
+    console.error(
+      "Sarvam empty content diagnostic:",
+      JSON.stringify({
+        http_status: response.status,
+        model: result?.model,
+        finish_reason: finishReason,
+        usage,
+        reasoning_content_present: reasoningPresent,
+        choices_count: Array.isArray(result?.choices)
+          ? result.choices.length
+          : 0,
+        response_preview: JSON.stringify(result).slice(0, 2500)
+      })
+    );
+
     throw new Error(
-      "Sarvam did not return generated message content"
+      "Sarvam returned no visible message content. " +
+      `finish_reason=${finishReason}; ` +
+      `reasoning_content_present=${reasoningPresent}; ` +
+      `usage=${JSON.stringify(usage)}`
     );
   }
+
+  // --------------------------------------------------------
+  // PARSE GENERATED JSON
+  // --------------------------------------------------------
 
   let generated;
 
   try {
     generated = parseModelJson(content);
   } catch {
+    console.error(
+      "Sarvam returned content that was not valid JSON:",
+      content.slice(0, 2000)
+    );
+
     throw new Error(
-      "Sarvam returned invalid email JSON"
+      "Sarvam generated content, but it was not valid email JSON"
     );
   }
 
-  const allowedStatuses = [
-    "qualified",
-    "needs_review",
-    "not_a_fit"
-  ];
-
-  if (!allowedStatuses.includes(generated.fit_status)) {
+  if (
+    typeof generated.subject !== "string" ||
+    typeof generated.message !== "string"
+  ) {
     throw new Error(
-      "Sarvam returned an unsupported fit_status"
+      "Sarvam JSON is missing the subject or message field"
     );
-  }
-
-  if (generated.fit_status === "qualified") {
-    if (!generated.subject || !generated.message) {
-      throw new Error(
-        "Sarvam omitted the email subject or body"
-      );
-    }
   }
 
   return generated;
@@ -756,19 +687,38 @@ Return this JSON structure:
 
 
 // ============================================================
-// SEND EMAIL THROUGH COMPOSIO GMAIL
+// COMPOSIO: SEND GMAIL
+//
+// API endpoint:
+// POST /api/v3.1/tools/execute/GMAIL_SEND_EMAIL
+//
+// The exact arguments must match the input schema of the
+// GMAIL_SEND_EMAIL version enabled in your Composio project.
 // ============================================================
 
-async function sendGmailEmail(
+async function sendEmailWithComposio(
   env,
   connectionId,
+  userId,
   recipient,
   subject,
   body
 ) {
   const url =
     `${COMPOSIO_BASE_URL}/tools/execute/` +
-    encodeURIComponent(GMAIL_TOOL);
+    encodeURIComponent(COMPOSIO_GMAIL_TOOL);
+
+  const requestBody = {
+    connected_account_id: connectionId,
+    user_id: userId,
+    version: env.COMPOSIO_GMAIL_VERSION || "latest",
+
+    arguments: {
+      recipient_email: recipient,
+      subject: subject,
+      body: body
+    }
+  };
 
   const response = await fetchWithTimeout(
     url,
@@ -778,109 +728,69 @@ async function sendGmailEmail(
         "x-api-key": env.COMPOSIO_API_KEY,
         "Content-Type": "application/json"
       },
-      body: JSON.stringify({
-        connected_account_id: connectionId,
-        version: env.COMPOSIO_GMAIL_VERSION || "latest",
-        arguments: {
-          recipient_email: recipient,
-          subject: subject,
-          body: body
-        }
-      })
+      body: JSON.stringify(requestBody)
     },
-    45000
+    60000
   );
 
-  const text = await response.text();
+  const responseText = await response.text();
 
   let result;
 
   try {
-    result = text ? JSON.parse(text) : {};
+    result = responseText
+      ? JSON.parse(responseText)
+      : {};
   } catch {
     result = {
-      raw_response: text
+      raw_response: responseText.slice(0, 2000)
     };
   }
 
   if (!response.ok) {
     return {
       success: false,
-      data: {
+      response: {
         http_status: response.status,
-        response: result
+        details: result
       }
     };
   }
 
-  // Composio normally returns an execution result containing
-  // success information and/or the tool output.
+  // Fail closed: do not save leads.message unless the
+  // Composio response explicitly confirms successful execution.
   //
-  // A successful HTTP response alone does not necessarily
-  // prove that the underlying Gmail action succeeded.
+  // Check common Composio response shapes.
+  const successful =
+    result.successful === true ||
+    result.success === true;
 
-  if (
-    result.successful === false ||
-    result.success === false ||
-    result.error
-  ) {
+  if (!successful) {
     return {
       success: false,
-      data: result
+      response: result
     };
   }
 
-  // Some execution responses wrap tool data under data.
-  // Check common explicit failure fields there as well.
-  const toolData = result.data;
-
-  if (
-    toolData &&
-    (
-      toolData.successful === false ||
-      toolData.success === false ||
-      toolData.error
-    )
-  ) {
+  if (result.error) {
     return {
       success: false,
-      data: result
+      response: result
     };
   }
 
-  // Fail closed if the execution result has an explicit
-  // unsuccessful status.
-  const status = String(
-    result.status || ""
-  ).toLowerCase();
-
-  if (
-    status === "failed" ||
-    status === "error"
-  ) {
-    return {
-      success: false,
-      data: result
-    };
-  }
-
-  // The actual output structure depends on the Composio
-  // version/tool response. Verify this response format with
-  // your first test before enabling regular Cron.
   return {
     success: true,
-    data: result
+    response: result
   };
 }
 
 
 // ============================================================
-// SAVE EMAIL BODY TO leads.message
-//
-// Only save after the send action returns success.
+// SAVE EMAIL TO leads.message
 // ============================================================
 
-async function saveLeadMessage(
+async function saveMessage(
   env,
   leadId,
   message
@@ -906,19 +816,18 @@ async function saveLeadMessage(
 
   if (!Array.isArray(updated) || updated.length === 0) {
     throw new Error(
-      "Email was sent, but the lead message was not saved. " +
-      "Do not blindly retry this lead because it may cause a duplicate email."
+      "The email may have been sent, but message could not be saved. " +
+      "Do not blindly retry because that could send a duplicate."
     );
   }
 }
 
 
 // ============================================================
-// SENDER NAME SELECTION
+// CONSISTENT SENDER NAME
 //
-// Stable per application without a new database column.
-// These are examples of fictional names, not verified identities.
-// Use only an authorized sender identity.
+// Uses the same selection for the same application.
+// Use only a sender identity authorized for the account.
 // ============================================================
 
 function chooseSenderName(applicationId) {
@@ -937,30 +846,12 @@ function chooseSenderName(applicationId) {
 
   for (let i = 0; i < applicationId.length; i++) {
     hash = (
-      (hash * 31) +
+      hash * 31 +
       applicationId.charCodeAt(i)
     ) >>> 0;
   }
 
   return names[hash % names.length];
-}
-
-
-// ============================================================
-// EMAIL VALIDATION
-// ============================================================
-
-function isValidEmail(email) {
-  if (typeof email !== "string") {
-    return false;
-  }
-
-  const value = email.trim();
-
-  return (
-    value.length <= 254 &&
-    /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value)
-  );
 }
 
 
@@ -974,21 +865,31 @@ function normalizeDomain(value) {
   }
 
   try {
-    let domain = value.trim();
+    const input = /^https?:\/\//i.test(value.trim())
+      ? value.trim()
+      : "https://" + value.trim();
 
-    if (!/^https?:\/\//i.test(domain)) {
-      domain = "https://" + domain;
-    }
-
-    const parsed = new URL(domain);
-
-    return parsed.hostname
+    return new URL(input)
+      .hostname
       .replace(/^www\./i, "")
       .toLowerCase();
 
   } catch {
     return null;
   }
+}
+
+
+// ============================================================
+// EMAIL VALIDATION
+// ============================================================
+
+function isValidEmail(value) {
+  return (
+    typeof value === "string" &&
+    value.length <= 254 &&
+    /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value.trim())
+  );
 }
 
 
@@ -1005,31 +906,12 @@ function verifySignature(
     .replace(/\r\n/g, "\n")
     .trim();
 
-  const expectedEnding =
+  const expected =
     `Best,\n${senderName}\n${senderDomain}`;
 
-  if (!normalized.endsWith(expectedEnding)) {
+  if (!normalized.endsWith(expected)) {
     throw new Error(
-      "Email signature does not match the required format"
-    );
-  }
-
-  // Company name must not appear in the signature itself.
-  const signature = normalized.slice(
-    normalized.lastIndexOf("\nBest,") + 1
-  );
-
-  if (
-    signature
-      .split("\n")
-      .some((line, index) =>
-        index > 0 &&
-        line.trim().toLowerCase() ===
-        "company"
-      )
-  ) {
-    throw new Error(
-      "Invalid company name in email signature"
+      "Generated signature does not match the required format"
     );
   }
 }
@@ -1039,19 +921,16 @@ function verifySignature(
 // PLACEHOLDER DETECTION
 // ============================================================
 
-function containsUnresolvedPlaceholders(value) {
-  const patterns = [
-    /\{\{[^}]+\}\}/,
-    /\[(?:sender name|your company|your name|company name)\]/i,
-    /<[^>]*(?:sender|company|domain)[^>]*>/i
-  ];
-
-  return patterns.some(pattern => pattern.test(value));
+function containsPlaceholders(value) {
+  return (
+    /\{\{[^}]+\}\}/.test(value) ||
+    /\[(?:sender name|your company|your name|company name)\]/i.test(value)
+  );
 }
 
 
 // ============================================================
-// MODEL JSON PARSER
+// PARSE MODEL JSON
 // ============================================================
 
 function parseModelJson(content) {
@@ -1069,7 +948,7 @@ function parseModelJson(content) {
     const start = value.indexOf("{");
     const end = value.lastIndexOf("}");
 
-    if (start === -1 || end <= start) {
+    if (start < 0 || end <= start) {
       throw new Error("No JSON object found");
     }
 
@@ -1104,7 +983,7 @@ async function fetchWithTimeout(
   } catch (error) {
     if (error.name === "AbortError") {
       throw new Error(
-        "Request timed out: " + new URL(url).hostname
+        `Request timed out: ${new URL(url).hostname}`
       );
     }
 
@@ -1116,21 +995,16 @@ async function fetchWithTimeout(
 
 
 // ============================================================
-// ERROR TEXT HELPER
+// SAFE ERROR STRING
 // ============================================================
 
-function safeErrorText(value) {
+function safeError(value) {
   try {
-    let text = typeof value === "string"
+    const result = typeof value === "string"
       ? value
       : JSON.stringify(value);
 
-    if (!text) {
-      return "Unknown error";
-    }
-
-    // Avoid returning excessively large error responses.
-    return text.slice(0, 1500);
+    return (result || "Unknown error").slice(0, 1800);
 
   } catch {
     return "Unknown error";
@@ -1139,10 +1013,10 @@ function safeErrorText(value) {
 
 
 // ============================================================
-// JSON RESPONSE HELPER
+// JSON RESPONSE
 // ============================================================
 
-function jsonResponse(data, status = 200) {
+function json(data, status = 200) {
   return new Response(
     JSON.stringify(data, null, 2),
     {
@@ -1153,4 +1027,4 @@ function jsonResponse(data, status = 200) {
       }
     }
   );
-        }
+              }
